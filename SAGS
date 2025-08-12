@@ -1,96 +1,74 @@
-import torch
-import torch.nn.functional as F
-from torchvision import transforms as T
-
 class SAGS:
-    def __init__(self, sigma=None, kernel_sizes=None, sigmas=None, weights=None, device='cuda'):
-        self.device = device
-        if sigma is None:
-            self.sigma = 0.98
-        if weights is None:
-            self.weights = [0.52, 0.43, 0.05]
-        if sigmas is None:
-            self.sigmas = [0.82, 4.74, 0.75]
-        if kernel_sizes is None:
-            self.kernel_sizes = [5, 13, 9]
+    def __init__(self,
+                 inter_sigma=0.98,
+                 multi_kernel_sizes=None,
+                 multi_sigmas=None,
+                 multi_weights=None,
+                 device='cuda'):
+        if multi_kernel_sizes is None:
+            multi_kernel_sizes = [5, 13, 9]
+        if multi_sigmas is None:
+            multi_sigmas = [0.82, 4.74, 0.75]
+        if multi_weights is None:
+            multi_weights = [0.52, 0.43, 0.05]
 
-    def gaussian_kernel_2d(self, kernel_size: int, sigma: float):
-        """生成 2D 高斯核"""
+        self.inter_sigma = inter_sigma
+        self.multi_kernel_sizes = multi_kernel_sizes
+        self.multi_sigmas = multi_sigmas
+        self.multi_weights = multi_weights
+        self.device = device
+
+    @staticmethod
+    def gaussian_kernel_1d(kernel_size: int, sigma: float):
         k = kernel_size // 2
-        x_coord = torch.arange(-k, k + 1, dtype=torch.float32, device=self.device)
+        x = torch.arange(-k, k + 1, dtype=torch.float32)
+        kernel = torch.exp(-(x ** 2) / (2 * sigma ** 2))
+        kernel /= kernel.sum()
+        return kernel
+
+    @staticmethod
+    def gaussian_kernel_2d(kernel_size: int, sigma: float, device='cuda'):
+        k = kernel_size // 2
+        x_coord = torch.arange(-k, k + 1, dtype=torch.float32, device=device)
         y_coord = x_coord.clone()
         xx, yy = torch.meshgrid(x_coord, y_coord, indexing='ij')
         kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
         kernel /= kernel.sum()
+        return kernel.view(1, 1, kernel_size, kernel_size)  # [1,1,H,W]
 
-        return kernel.view(1, 1, kernel_size, kernel_size)  # 形状: [1,1,H,W]
-
-    def gaussian_kernel_1d(self, kernel_size: int, sigma: float):
-        """生成 1D 高斯核"""
-        k = kernel_size // 2
-        x_coord = torch.arange(-k, k + 1, dtype=torch.float32, device=self.device)
-        kernel = torch.exp(-(x_coord ** 2) / (2 * sigma ** 2))
-        kernel /= kernel.sum()
-
-        return kernel.view(1, 1, kernel_size)  # 形状: [1,1,H]
-
-    def multi_scale_gaussian_smoothing(self, input_tensor: torch.Tensor):
-        """
-        **通道内多尺度高斯滤波**
-        对 **每个通道** 进行 **多尺度** 的 2D 高斯平滑，然后加权融合。
-        """
-        batch_size, channels, height, width = input_tensor.shape
-        smoothed_tensors = []
-        for kernel_size, sigma, weight in zip(self.kernel_sizes, self.sigmas, self.weights):
-            kernel = self.gaussian_kernel_2d(kernel_size, sigma)
-            kernel = kernel.expand(channels, 1, kernel_size, kernel_size)
-            smoothed = F.conv2d(input_tensor, kernel, padding=kernel_size // 2, groups=channels)
-            smoothed_tensors.append(weight * smoothed)
-
-        # **多尺度融合**
-        smoothed_tensor = sum(smoothed_tensors)  # [batch_size, 3, height, width]
-
-        return smoothed_tensor
-
-    def inter_channel_gaussian_smoothing(self, input_tensor: torch.Tensor):
-        """
-        **通道间高斯平滑**
-        使用 1×1 卷积在通道之间传播信息。
-        """
+    # ICC
+    def inter_channel_smoothing(self, input_tensor: torch.Tensor, kernel_size=3):
         batch_size, channels, height, width = input_tensor.shape
         device = input_tensor.device
 
-        # 生成高斯核
-        kernel = self.gaussian_kernel_1d(3, self.sigma)
-        padding = 3 // 2
+        kernel = self.gaussian_kernel_1d(kernel_size, self.inter_sigma).to(device)
+        padding = kernel_size // 2
 
-        weights = torch.zeros(3, 3).to(device)
-        for i in range(3):
+        weights = torch.zeros(channels, channels).to(device)
+        for i in range(channels):
             start_idx = max(0, i - padding)
-            end_idx = min(3, i + padding + 1)
-            kernel_slice = kernel[max(0, padding - i):kernel_size - max(0, (i + padding + 1) - 3)]
+            end_idx = min(channels, i + padding + 1)
+            kernel_slice = kernel[max(0, padding - i):kernel_size - max(0, (i + padding + 1) - channels)]
             weights[i, start_idx:end_idx] = kernel_slice
 
-        # 重塑输入张量为 [batch_size, 3, height * width]
-        x = input_tensor.view(batch_size, 3, -1)
-        # 在通道维度上应用平滑（矩阵乘法）
+        x = input_tensor.view(batch_size, channels, -1)
         smoothed = torch.matmul(weights, x)
+        return smoothed.view(batch_size, channels, height, width)
 
-        # 恢复原始形状
-        smoothed = smoothed.view(batch_size, 3, height, width)
+    # MSF
+    def multi_scale_smoothing(self, input_tensor: torch.Tensor):
+        batch_size, channels, height, width = input_tensor.shape
+        device = input_tensor.device
+        smoothed_tensors = []
+        for kernel_size, sigma, weight in zip(self.multi_kernel_sizes, self.multi_sigmas, self.multi_weights):
+            kernel = self.gaussian_kernel_2d(kernel_size, sigma, device)
+            kernel = kernel.expand(channels, 1, kernel_size, kernel_size)
+            smoothed = F.conv2d(input_tensor, kernel, padding=kernel_size // 2, groups=channels)
+            smoothed_tensors.append(weight * smoothed)
+        return sum(smoothed_tensors)
 
-        return smoothed
-
-    def full_gaussian_smoothing(self, input_tensor: torch.Tensor):
-        smoothed_tensor = self.inter_channel_gaussian_smoothing(input_tensor)
-        smoothed_tensor = self.multi_scale_gaussian_smoothing(smoothed_tensor)
-        return smoothed_tensor
-
-# 示例用法
-if __name__ == '__main__':
-    # 假设你有一个输入张量
-    input_tensor = torch.randn(1, 3, 224, 224).to('cuda')
-    gaussian_smoothing = GaussianSmoothing()
-
-    smoothed_tensor = gaussian_smoothing.full_gaussian_smoothing(input_tensor)
-    print(smoothed_tensor.shape)
+    #SAGS
+    def sags(self, input_tensor: torch.Tensor):
+        x = self.inter_channel_smoothing(input_tensor)
+        x = self.multi_scale_smoothing(x)
+        return x
