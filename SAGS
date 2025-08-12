@@ -1,3 +1,6 @@
+import torch
+import torch.nn.functional as F
+
 class SAGS:
     def __init__(self,
                  inter_sigma=0.98,
