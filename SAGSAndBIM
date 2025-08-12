@@ -1,0 +1,60 @@
+from SAGS import SAGS
+
+class SAGSAndBIM(Attack):
+    def __init__(self, model, eps=8 / 255, alpha=2 / 255, steps=10):
+        super().__init__("BIM", model)
+        self.eps = eps
+        self.alpha = alpha
+        # 创建SAGS类的实例
+        self.SAGS = SAGS()
+
+        if steps == 0:
+            self.steps = int(min(eps * 255 + 4, 1.25 * eps * 255))
+        else:
+            self.steps = steps
+        self.supported_mode = ["default", "targeted"]
+
+    def forward(self, images, labels):
+        r"""
+        Overridden.
+        """
+
+        images = images.clone().detach().to(self.device)
+        labels = labels.clone().detach().to(self.device)
+
+        if self.targeted:
+            target_labels = self.get_target_label(images, labels)
+
+        loss = nn.CrossEntropyLoss()
+
+        ori_images = images.clone().detach()
+
+        for _ in range(self.steps):
+            images.requires_grad = True
+            outputs = self.get_logits(images)
+
+            # Calculate loss
+            if self.targeted:
+                cost = -loss(outputs, target_labels)
+            else:
+                cost = loss(outputs, labels)
+
+            # Update adversarial images
+            grad = torch.autograd.grad(
+                cost, images, retain_graph=False, create_graph=False
+            )[0]
+
+            # use SAGS
+            grad = self.SAGS.sags(grad)
+
+            adv_images = images + self.alpha * grad.sign()
+            a = torch.clamp(ori_images - self.eps, min=0)
+            b = (adv_images >= a).float() * adv_images + (
+                    adv_images < a
+            ).float() * a  # nopep8
+            c = (b > ori_images + self.eps).float() * (ori_images + self.eps) + (
+                    b <= ori_images + self.eps
+            ).float() * b  # nopep8
+            images = torch.clamp(c, max=1).detach()
+
+        return images
